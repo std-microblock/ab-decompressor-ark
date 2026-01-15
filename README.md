@@ -1,6 +1,6 @@
 # ab-decompressor
 
-一个用于解压 UnityFS 格式 AssetBundle 的 C++ 工具。支持将压缩的 `.ab` 文件还原为未压缩状态，特别处理了《明日方舟》游戏特有的 LZ4 变体。
+一个用于解压 UnityFS 格式 AssetBundle 的 C++ 工具。将压缩的 `.ab` 文件还原为未压缩状态，特别支持了《明日方舟》游戏特有的 LZ4 变体。
 
 ## 功能
 
