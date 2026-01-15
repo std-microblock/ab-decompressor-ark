@@ -29,10 +29,10 @@ xmake
 
 ```bash
 # 标准解压
-./UnpackAB --game std input.ab [output.ab]
+lzham-ab-decompressor.exe --game std input.ab [output.ab]
 
 # 明日方舟解压
-./UnpackAB --game arknights char_002_amiya.ab
+lzham-ab-decompressor.exe --game arknights char_002_amiya.ab
 ```
 
 ### 参数说明
