@@ -382,10 +382,14 @@ void process_file(const fs::path &input_path, const fs::path &output_path,
 
   std::vector<ArchiveBlockInfo> new_blocks;
 
+  reader.align(16);
   for (size_t i = 0; i < blocks.size(); ++i) {
     auto &old_blk = blocks[i];
-    reader.align(16);
     auto compressed_bytes = reader.get_span(old_blk.compressed_size);
+
+    if (old_blk.flags & FLAG_BLOCK_INFO_NEEDS_ALIGNMENT) {
+      reader.align(16);
+    }
 
     std::vector<uint8_t> raw =
         decompress_block(old_blk.get_compression(), compressed_bytes,
