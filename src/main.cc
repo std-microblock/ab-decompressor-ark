@@ -235,7 +235,8 @@ public:
 
   std::vector<uint8_t> read_bytes(size_t n) {
     if (pos_ + n > data_.size())
-      throw std::out_of_range("buffer overflow");
+      throw std::out_of_range(std::format(
+          "buffer overflow: pos {} + n {} > size {}", pos_, n, data_.size()));
     std::vector<uint8_t> d(data_.begin() + pos_, data_.begin() + pos_ + n);
     pos_ += n;
     return d;
@@ -243,7 +244,8 @@ public:
 
   std::span<const uint8_t> get_span(size_t n) {
     if (pos_ + n > data_.size())
-      throw std::out_of_range("buffer overflow");
+      throw std::out_of_range(std::format(
+          "buffer overflow: pos {} + n {} > size {}", pos_, n, data_.size()));
     auto s = std::span<const uint8_t>(data_.data() + pos_, n);
     pos_ += n;
     return s;
@@ -382,14 +384,11 @@ void process_file(const fs::path &input_path, const fs::path &output_path,
 
   std::vector<ArchiveBlockInfo> new_blocks;
 
-  reader.align(16);
+  if (flags & FLAG_BLOCK_INFO_NEEDS_ALIGNMENT)
+    reader.align(16);
   for (size_t i = 0; i < blocks.size(); ++i) {
     auto &old_blk = blocks[i];
     auto compressed_bytes = reader.get_span(old_blk.compressed_size);
-
-    if (old_blk.flags & FLAG_BLOCK_INFO_NEEDS_ALIGNMENT) {
-      reader.align(16);
-    }
 
     std::vector<uint8_t> raw =
         decompress_block(old_blk.get_compression(), compressed_bytes,
