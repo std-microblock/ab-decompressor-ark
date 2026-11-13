@@ -30,6 +30,15 @@ enum class CompressionType : uint8_t {
 
 enum class GameMode { Standard, Arknights };
 
+// --transform: do not decode the payload at all. Undo the Arknights permutation so that every
+// block becomes a *standard* LZ4 block, and advertise it as such (compression id 4 -> 2). The
+// stream keeps its exact length, so this is a pure byte-level rewrite and runs at memcpy speed;
+// stock Unity players, which reject id 4 with "Decompressing this format (4) is not supported",
+// then load the bundle natively.
+static bool g_transform = false;
+// --dir sets this so a bulk run prints one line per file instead of per block.
+static bool g_quiet = false;
+
 constexpr uint32_t FLAG_COMPRESSION_MASK = 0x3F;
 constexpr uint32_t FLAG_BLOCKS_AND_DIR_COMBINED = 0x40;
 constexpr uint32_t FLAG_BLOCK_INFO_AT_END = 0x80;
@@ -130,6 +139,49 @@ std::vector<uint8_t> decompress_lzak(std::span<const uint8_t> compressed_data,
   return dest;
 }
 
+// Arknights stores its LZ4 streams with the token nibbles flipped and the 2-byte match offset
+// byte-swapped. Undoing that in the *compressed* stream is enough to obtain a plain LZ4 block:
+// literals and the extra-length bytes are already in place and nothing changes length.
+std::vector<uint8_t> ark_to_standard_lz4(std::span<const uint8_t> compressed_data,
+                                        uint32_t uncompressed_size) {
+  std::vector<uint8_t> data(compressed_data.begin(), compressed_data.end());
+
+  size_t ip = 0;
+  size_t op = 0;
+  size_t size = data.size();
+
+  while (ip < size) {
+    uint8_t token = data[ip];
+    uint8_t literal_len = token & 0x0F;
+    uint8_t match_len_nibble = (token >> 4) & 0x0F;
+
+    data[ip] = static_cast<uint8_t>((literal_len << 4) | match_len_nibble);
+    ip++;
+
+    size_t current_literal_len = literal_len;
+    if (literal_len == 0x0F)
+      current_literal_len += read_extra_length(data, ip);
+
+    ip += current_literal_len;
+    op += current_literal_len;
+
+    if (op >= static_cast<size_t>(uncompressed_size))
+      break;
+    if (ip + 2 > size)
+      break;
+
+    std::swap(data[ip], data[ip + 1]);
+    ip += 2;
+
+    size_t current_match_len = match_len_nibble;
+    if (match_len_nibble == 0x0F)
+      current_match_len += read_extra_length(data, ip);
+    op += current_match_len + 4;
+  }
+
+  return data;
+}
+
 std::vector<uint8_t> decompress_block(CompressionType type,
                                       std::span<const uint8_t> src,
                                       uint32_t decompressed_size,
@@ -169,6 +221,8 @@ std::vector<uint8_t> decompress_block(CompressionType type,
   }
 
   case CompressionType::Lzham: {
+    if (g_transform)
+      return ark_to_standard_lz4(src, decompressed_size);
     if (mode == GameMode::Arknights) {
       return decompress_lzak(src, decompressed_size);
     } else {
@@ -380,7 +434,8 @@ void process_file(const fs::path &input_path, const fs::path &output_path,
   if (flags & FLAG_BLOCKS_AND_DIR_COMBINED) {
   }
 
-  std::cout << std::format("Decompressing {} blocks...\n", blocks.size());
+  if (!g_quiet)
+    std::cout << std::format("Decompressing {} blocks...\n", blocks.size());
 
   std::vector<ArchiveBlockInfo> new_blocks;
 
@@ -390,25 +445,41 @@ void process_file(const fs::path &input_path, const fs::path &output_path,
     auto &old_blk = blocks[i];
     auto compressed_bytes = reader.get_span(old_blk.compressed_size);
 
-    std::vector<uint8_t> raw =
-        decompress_block(old_blk.get_compression(), compressed_bytes,
-                         old_blk.uncompressed_size, game_mode);
+    std::vector<uint8_t> raw;
+    uint16_t new_block_flags = 0;
+    if (g_transform) {
+      // Keep every byte: an Arknights block only has its permutation undone and is re-labelled as
+      // standard LZ4; blocks that are already standard are copied through untouched.
+      raw.assign(compressed_bytes.begin(), compressed_bytes.end());
+      new_block_flags = static_cast<uint16_t>(old_blk.get_compression());
+      if (old_blk.get_compression() == CompressionType::Lzham) {
+        raw = ark_to_standard_lz4(compressed_bytes, old_blk.uncompressed_size);
+        new_block_flags = static_cast<uint16_t>(CompressionType::Lz4);
+      }
+    } else {
+      raw = decompress_block(old_blk.get_compression(), compressed_bytes,
+                             old_blk.uncompressed_size, game_mode);
+    }
 
     size_t offset_in_new_stream = all_decompressed_data.size();
     all_decompressed_data.insert(all_decompressed_data.end(), raw.begin(),
                                  raw.end());
 
     ArchiveBlockInfo new_blk;
-    new_blk.uncompressed_size = static_cast<uint32_t>(raw.size());
+    new_blk.uncompressed_size =
+        g_transform ? old_blk.uncompressed_size
+                    : static_cast<uint32_t>(raw.size());
     new_blk.compressed_size = static_cast<uint32_t>(raw.size());
-    new_blk.flags = 0;
+    new_blk.flags = new_block_flags;
     new_blocks.push_back(new_blk);
 
-    std::cout << std::format("\rBlock {}/{} ({} -> {})", i + 1, blocks.size(),
-                             old_blk.compressed_size, raw.size())
-              << std::flush;
+    if (!g_quiet)
+      std::cout << std::format("\rBlock {}/{} ({} -> {})", i + 1, blocks.size(),
+                               old_blk.compressed_size, raw.size())
+                << std::flush;
   }
-  std::cout << "\nBlocks decompressed. Rebuilding header...\n";
+  if (!g_quiet)
+    std::cout << "\nBlocks decompressed. Rebuilding header...\n";
 
   std::vector<uint8_t> new_block_info_blob;
 
@@ -483,14 +554,21 @@ void process_file(const fs::path &input_path, const fs::path &output_path,
   writer.write_bytes(all_decompressed_data.data(),
                      all_decompressed_data.size());
 
-  std::cout << "Success. Output written to " << output_path.string() << "\n";
+  if (!g_quiet)
+    std::cout << "Success. Output written to " << output_path.string() << "\n";
 }
 
 int main(int argc, char **argv) {
   if (argc < 2) {
     std::println(
         stderr,
-        "Usage: UnpackAB --game [std|arknights] <input.ab> [output.ab]");
+        "Usage: UnpackAB [--game std|arknights] [--transform] <input.ab> [output.ab]\n"
+        "       UnpackAB [--transform] --dir <folder>");
+    std::println(stderr,
+                 "  --transform  undo the Arknights permutation in place and re-label the block as\n"
+                 "               standard LZ4 (no decompression, same size); stock Unity players\n"
+                 "               can then load the bundle\n"
+                 "  --dir        convert every *.ab under <folder> in place (implies in-place rewrite)");
     return 1;
   }
 
@@ -501,19 +579,42 @@ int main(int argc, char **argv) {
     fs::path input_path;
     fs::path output_path;
     GameMode mode = GameMode::Standard;
+    bool dir_mode = false;
 
     int arg_idx = 1;
-    if (std::string(argv[arg_idx]) == "--game") {
-      if (argc <= arg_idx + 1)
-        throw std::runtime_error("Missing game argument");
-      std::string g = argv[arg_idx + 1];
-      if (g == "arknights")
-        mode = GameMode::Arknights;
-      else if (g == "std")
-        mode = GameMode::Standard;
-      else
-        throw std::runtime_error("Unknown game mode");
-      arg_idx += 2;
+    while (arg_idx < argc) {
+      std::string flag = argv[arg_idx];
+      if (flag == "--game") {
+        if (argc <= arg_idx + 1)
+          throw std::runtime_error("Missing game argument");
+        std::string g = argv[arg_idx + 1];
+        if (g == "arknights")
+          mode = GameMode::Arknights;
+        else if (g == "std")
+          mode = GameMode::Standard;
+        else
+          throw std::runtime_error("Unknown game mode");
+        arg_idx += 2;
+      } else if (flag == "--dir") {
+        dir_mode = true;
+        arg_idx += 1;
+      } else if (flag == "--transform") {
+        g_transform = true;
+        arg_idx += 1;
+      } else if (flag == "--mode") {
+        if (argc <= arg_idx + 1)
+          throw std::runtime_error("Missing mode argument");
+        std::string m = argv[arg_idx + 1];
+        if (m == "transform")
+          g_transform = true;
+        else if (m == "decompress")
+          g_transform = false;
+        else
+          throw std::runtime_error("Unknown mode (expected transform|decompress)");
+        arg_idx += 2;
+      } else {
+        break;
+      }
     }
 
     if (arg_idx >= argc)
@@ -524,9 +625,46 @@ int main(int argc, char **argv) {
       output_path = argv[arg_idx];
     } else {
 
-      output_path =
-          input_path.parent_path() / (input_path.stem().string() + "_unpacked" +
-                                      input_path.extension().string());
+      output_path = input_path.parent_path() /
+                    (input_path.stem().string() +
+                     (g_transform ? "_std" : "_unpacked") +
+                     input_path.extension().string());
+    }
+
+    if (dir_mode) {
+      g_quiet = true;
+      std::error_code ec;
+      fs::recursive_directory_iterator it(input_path, ec), last;
+      if (ec)
+        throw std::runtime_error(
+            std::format("Cannot walk {}: {}", input_path.string(), ec.message()));
+      size_t ok = 0;
+      size_t failed = 0;
+      for (; it != last; it.increment(ec)) {
+        if (ec) {
+          std::println(stderr, "walk error: {}", ec.message());
+          break;
+        }
+        if (!it->is_regular_file())
+          continue;
+        auto path = it->path();
+        if (path.extension() != ".ab")
+          continue;
+        try {
+          fs::path temp = path;
+          temp += ".tmp";
+          process_file(path, temp, mode);
+          fs::rename(temp, path);
+          ok++;
+        } catch (const std::exception &e) {
+          std::println(stderr, "  failed {}: {}", path.string(), e.what());
+          failed++;
+        }
+        if ((ok + failed) % 500 == 0)
+          std::println("  {} converted, {} failed", ok, failed);
+      }
+      std::println("done: {} converted, {} failed", ok, failed);
+      return failed ? 1 : 0;
     }
 
     if (input_path == output_path) {
